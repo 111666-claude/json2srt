@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -12,70 +13,28 @@ import (
 	"sync"
 )
 
-// --- Struct Definitions ---
-// Timestamp represents a timestamp structure containing start and end times
-type Timestamp struct {
-	From string `json:"from"` // Start time, format "00:00:00,000"
-	To   string `json:"to"`   // End time, format "00:00:01,960"
+// stringList collects repeatable string flags.
+type stringList []string
+
+func (s *stringList) String() string {
+	return strings.Join(*s, ",")
 }
 
-// Token represents a single word in transcription
-type Token struct {
-	Text       string    `json:"text"`       // Token text
-	Timestamps Timestamp `json:"timestamps"` // Timestamps for this token
-}
-
-// Segment represents a paragraph in transcription
-type Segment struct {
-	Timestamps Timestamp `json:"timestamps"` // Timestamps for the paragraph
-	Text       string    `json:"text"`       // Text content of the paragraph
-	Tokens     []Token   `json:"tokens"`     // Token list for this paragraph
-}
-
-// WhisperOutput represents the root structure of Whisper transcription output
-type WhisperOutput struct {
-	Transcription []Segment `json:"transcription"` // List of transcription paragraphs
+func (s *stringList) Set(value string) error {
+	*s = append(*s, value)
+	return nil
 }
 
 // --- Core Logic ---
-// extractTimestamps extracts start and end timestamps from segment's tokens
-// Returns startTime, endTime, hasValidTokens
-func extractTimestamps(segment Segment) (string, string, bool) {
-	var startTime, endTime string
-	hasValidTokens := false
-
-	// Find first non-noise token's start time
-	for _, token := range segment.Tokens {
-		if !strings.HasPrefix(token.Text, "[_") && token.Text != "" {
-			// Use token's From as start time
-			startTime = token.Timestamps.From
-			hasValidTokens = true
-			break
-		}
-	}
-
-	// 查找最后一个非噪音 token 的结束时间
-	for j := len(segment.Tokens) - 1; j >= 0; j-- {
-		token := segment.Tokens[j]
-		if !strings.HasPrefix(token.Text, "[_") && token.Text != "" {
-			endTime = token.Timestamps.To
-			hasValidTokens = true
-			break
-		}
-	}
-
-	// 如果没有有效 tokens，使用 segment 的时间戳
-	if !hasValidTokens || startTime == "" || endTime == "" {
-		startTime = segment.Timestamps.From
-		endTime = segment.Timestamps.To
-	}
-
-	return startTime, endTime, hasValidTokens
-}
 
 // processFile 处理单个 JSON 文件，生成 SRT 文件
 // ctx 用于支持取消操作
 func processFile(ctx context.Context, jsonPath string) error {
+	return processFileWithOptions(ctx, jsonPath, DefaultOptions())
+}
+
+// processFileWithOptions is processFile with explicit conversion options.
+func processFileWithOptions(ctx context.Context, jsonPath string, options Options) error {
 	// 检查 context 是否已取消
 	select {
 	case <-ctx.Done():
@@ -98,29 +57,22 @@ func processFile(ctx context.Context, jsonPath string) error {
 		return fmt.Errorf("JSON 文件 %s 缺少 transcription 字段", filepath.Base(jsonPath))
 	}
 
-	var srtBuilder strings.Builder
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
 
-	// 顺序处理 segments
-	for i, segment := range output.Transcription {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		startTime, endTime, _ := extractTimestamps(segment)
-		if startTime == "" || endTime == "" {
-			continue // 跳过无效 segment
-		}
-
-		text := strings.TrimSpace(segment.Text)
-		srtBuilder.WriteString(fmt.Sprintf("%d\n", i+1))
-		srtBuilder.WriteString(fmt.Sprintf("%s --> %s\n", startTime, endTime))
-		srtBuilder.WriteString(fmt.Sprintf("%s\n\n", text))
+	srtBody, warnings, err := Convert(output, options)
+	if err != nil {
+		return fmt.Errorf("生成字幕 %s 失败: %v", filepath.Base(jsonPath), err)
+	}
+	for _, warning := range warnings {
+		log.Printf("警告 %s: %s", filepath.Base(jsonPath), warning)
 	}
 
 	bom := []byte{0xEF, 0xBB, 0xBF}
-	content := []byte(srtBuilder.String())
+	content := []byte(srtBody)
 	dataToWrite := append(bom, content...)
 	if err := os.WriteFile(srtPath, dataToWrite, 0644); err != nil {
 		return fmt.Errorf("写入 SRT 文件 %s 失败: %v", filepath.Base(srtPath), err)
@@ -130,7 +82,7 @@ func processFile(ctx context.Context, jsonPath string) error {
 }
 
 // worker 处理文件的 goroutine
-func worker(ctx context.Context, id int, jobs <-chan string, wg *sync.WaitGroup) {
+func worker(ctx context.Context, id int, jobs <-chan string, wg *sync.WaitGroup, options Options) {
 	defer wg.Done()
 	for {
 		select {
@@ -141,15 +93,58 @@ func worker(ctx context.Context, id int, jobs <-chan string, wg *sync.WaitGroup)
 				return
 			}
 			fmt.Printf("Worker %d 开始处理文件: %s\n", id, filepath.Base(jsonPath))
-			if err := processFile(ctx, jsonPath); err != nil {
+			if err := processFileWithOptions(ctx, jsonPath, options); err != nil {
 				log.Printf("Worker %d 处理文件 %s 时出错: %v", id, filepath.Base(jsonPath), err)
 			}
 		}
 	}
 }
 
+// parseSpeakerNames parses repeated --speaker ID=NAME flags.
+func parseSpeakerNames(values []string) (map[string]string, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	names := make(map[string]string, len(values))
+	for _, value := range values {
+		separator := strings.Index(value, "=")
+		if separator < 0 {
+			return nil, fmt.Errorf("invalid --speaker value %q: expected ID=NAME", value)
+		}
+		id := strings.TrimSpace(value[:separator])
+		name := strings.TrimSpace(value[separator+1:])
+		if id == "" || name == "" {
+			return nil, fmt.Errorf("invalid --speaker value %q: expected ID=NAME", value)
+		}
+		if _, exists := names[id]; exists {
+			return nil, fmt.Errorf("duplicate --speaker mapping for %q", id)
+		}
+		names[id] = name
+	}
+	return names, nil
+}
+
 func main() {
 	ctx := context.Background() // 创建根 context，可用于取消操作
+
+	options := DefaultOptions()
+	var speakerFlags stringList
+	flag.Var(&speakerFlags, "speaker", "map a speaker ID to a display name, repeatable (e.g. SPEAKER_00=Alice)")
+	flag.StringVar(&options.SpeakerFormat, "speaker-format", options.SpeakerFormat, "speaker cue template; supports {name} and requires {text}")
+	flag.StringVar(&options.DefaultSpeaker, "default-speaker", options.DefaultSpeaker, "label for words without a speaker marker")
+	flag.DurationVar(&options.PauseGap, "pause-gap", options.PauseGap, "split cues on silences longer than this (0 disables)")
+	flag.IntVar(&options.MaxChars, "max-chars", options.MaxChars, "maximum spoken characters per cue (0 disables)")
+	flag.DurationVar(&options.MaxDuration, "max-duration", options.MaxDuration, "maximum cue duration (0 disables)")
+	flag.Parse()
+
+	names, err := parseSpeakerNames(speakerFlags)
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+	options.SpeakerNames = names
+	if err := options.Validate(); err != nil {
+		log.Fatalf("参数错误: %v", err)
+	}
 
 	// --- MODIFIED: 使用 os.Getwd() 获取当前终端的工作目录 ---
 	workDir, err := os.Getwd()
@@ -188,7 +183,7 @@ func main() {
 
 	for w := 1; w <= numWorkers; w++ {
 		wg.Add(1)
-		go worker(ctx, w, jobs, &wg)
+		go worker(ctx, w, jobs, &wg, options)
 	}
 
 	for _, path := range jsonPaths {
